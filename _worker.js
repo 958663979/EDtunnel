@@ -1,12 +1,22 @@
-// <!--GAMFC-->version base on commit c17ceb86be8e16c53fcfdf4b7dcd09e9e372863b, time is 2023-06-05 18:02:59 UTC<!--GAMFC-END-->.
+// <!--GAMFC-->version base on commit 43fad05dcdae3b723c53c226f8181fc5bd47223e, time is 2023-06-22 15:20:02 UTC<!--GAMFC-END-->.
 // @ts-ignore
 import { connect } from 'cloudflare:sockets';
 
 // How to generate your own UUID:
 // [Windows] Press "Win + R", input cmd and run:  Powershell -NoExit -Command "[guid]::NewGuid()"
-let userID = 'abb9883e-93de-4197-b4b3-68ad30419c7b';
+let userID = '77a571fb-4fd2-4b37-8596-1b7d9728bb5c';
 
-let proxyIP = "64.68.192." + Math.floor(Math.random() * 255);
+const proxyIPs = ["[2001:67c:2b0:db32:0:1:681a:404]"]; // ['cdn-all.xn--b6gac.eu.org', 'cdn.xn--b6gac.eu.org', 'cdn-b100.xn--b6gac.eu.org', 'edgetunnel.anycast.eu.org', 'cdn.anycast.eu.org'];
+let proxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+
+let dohURL = 'https://sky.rethinkdns.com/1:-Pf_____9_8A_AMAIgE8kMABVDDmKOHTAKg='; // https://cloudflare-dns.com/dns-query or https://dns.google/dns-query
+
+// v2board api environment variables
+let nodeId = ''; // 1
+
+let apiToken = ''; //abcdefghijklmnopqrstuvwxyz123456
+
+let apiHost = ''; // api.v2board.com
 
 if (!isValidUUID(userID)) {
 	throw new Error('uuid is not valid');
@@ -15,7 +25,7 @@ if (!isValidUUID(userID)) {
 export default {
 	/**
 	 * @param {import("@cloudflare/workers-types").Request} request
-	 * @param {{UUID: string, PROXYIP: string}} env
+	 * @param {{UUID: string, PROXYIP: string, DNS_RESOLVER_URL: string, NODE_ID: int, API_HOST: string, API_TOKEN: string}} env
 	 * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
 	 * @returns {Promise<Response>}
 	 */
@@ -23,12 +33,62 @@ export default {
 		try {
 			userID = env.UUID || userID;
 			proxyIP = env.PROXYIP || proxyIP;
+			dohURL = env.DNS_RESOLVER_URL || dohURL;
+			nodeId = env.NODE_ID || nodeId;
+			apiToken = env.API_TOKEN || apiToken;
+			apiHost = env.API_HOST || apiHost;
 			const upgradeHeader = request.headers.get('Upgrade');
 			if (!upgradeHeader || upgradeHeader !== 'websocket') {
 				const url = new URL(request.url);
 				switch (url.pathname) {
-					case '/':
-						return new Response(JSON.stringify(request.cf), { status: 200 });
+					case '/cf':
+						return new Response(JSON.stringify(request.cf, null, 4), {
+							status: 200,
+							headers: {
+								"Content-Type": "application/json;charset=utf-8",
+							},
+						});
+					case '/connect': // for test connect to cf socket
+						const [hostname, port] = ['cloudflare.com', '80'];
+						console.log(`Connecting to ${hostname}:${port}...`);
+
+						try {
+							const socket = await connect({
+								hostname: hostname,
+								port: parseInt(port, 10),
+							});
+
+							const writer = socket.writable.getWriter();
+
+							try {
+								await writer.write(new TextEncoder().encode('GET / HTTP/1.1\r\nHost: ' + hostname + '\r\n\r\n'));
+							} catch (writeError) {
+								writer.releaseLock();
+								await socket.close();
+								return new Response(writeError.message, { status: 500 });
+							}
+
+							writer.releaseLock();
+
+							const reader = socket.readable.getReader();
+							let value;
+
+							try {
+								const result = await reader.read();
+								value = result.value;
+							} catch (readError) {
+								await reader.releaseLock();
+								await socket.close();
+								return new Response(readError.message, { status: 500 });
+							}
+
+							await reader.releaseLock();
+							await socket.close();
+
+							return new Response(new TextDecoder().decode(value), { status: 200 });
+						} catch (connectError) {
+							return new Response(connectError.message, { status: 500 });
+						}
 					case `/${userID}`: {
 						const vlessConfig = getVLESSConfig(userID, request.headers.get('Host'));
 						return new Response(`${vlessConfig}`, {
@@ -39,7 +99,12 @@ export default {
 						});
 					}
 					default:
-						return new Response('Not found', { status: 404 });
+						// return new Response('Not found', { status: 404 });
+						// For any other path, reverse proxy to 'www.fmprc.gov.cn' and return the original response
+						url.hostname = 'www.bing.com';
+						url.protocol = 'https:';
+						request = new Request(url, request);
+						return await fetch(request);
 				}
 			} else {
 				return await vlessOverWSHandler(request);
@@ -80,13 +145,14 @@ async function vlessOverWSHandler(request) {
 	let remoteSocketWapper = {
 		value: null,
 	};
+	let udpStreamWrite = null;
 	let isDns = false;
 
 	// ws --> remote
 	readableWebSocketStream.pipeTo(new WritableStream({
 		async write(chunk, controller) {
-			if (isDns) {
-				return await handleDNSQuery(chunk, webSocket, null, log);
+			if (isDns && udpStreamWrite) {
+				return udpStreamWrite(chunk);
 			}
 			if (remoteSocketWapper.value) {
 				const writer = remoteSocketWapper.value.writable.getWriter()
@@ -98,12 +164,12 @@ async function vlessOverWSHandler(request) {
 			const {
 				hasError,
 				message,
-				portRemote = 443,
+				portRemote = [443, 8443, 2053, 2083, 2087, 2096, 80, 8080, 8880, 2052, 2082, 2086, 2095],
 				addressRemote = '',
 				rawDataIndex,
 				vlessVersion = new Uint8Array([0, 0]),
 				isUDP,
-			} = processVlessHeader(chunk, userID);
+			} = await processVlessHeader(chunk, userID);
 			address = addressRemote;
 			portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '
 				} `;
@@ -123,12 +189,16 @@ async function vlessOverWSHandler(request) {
 					return;
 				}
 			}
-			// ["version", "附加信息长度 N"]
+			// ["version", "闄勫姞淇℃伅闀垮害 N"]
 			const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
 			const rawClientData = chunk.slice(rawDataIndex);
 
+			// TODO: support udp here when cf runtime has udp support
 			if (isDns) {
-				return handleDNSQuery(rawClientData, webSocket, vlessResponseHeader, log);
+				const { write } = await handleUDPOutBound(webSocket, vlessResponseHeader, log);
+				udpStreamWrite = write;
+				udpStreamWrite(rawClientData);
+				return;
 			}
 			handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, rawClientData, webSocket, vlessResponseHeader, log);
 		},
@@ -148,6 +218,81 @@ async function vlessOverWSHandler(request) {
 		webSocket: client,
 	});
 }
+
+let apiResponseCache = null;
+let cacheTimeout = null;
+
+/**
+ * Fetches the API response from the server and caches it for future use.
+ * @returns {Promise<object|null>} A Promise that resolves to the API response object or null if there was an error.
+ */
+async function fetchApiResponse() {
+	const requestOptions = {
+		method: 'GET',
+		redirect: 'follow'
+	};
+
+	try {
+		const response = await fetch(`https://${apiHost}/api/v1/server/UniProxy/user?node_id=${nodeId}&node_type=v2ray&token=${apiToken}`, requestOptions);
+
+		if (!response.ok) {
+			console.error('Error: Network response was not ok');
+			return null;
+		}
+		const apiResponse = await response.json();
+		apiResponseCache = apiResponse;
+
+		// Refresh the cache every 5 minutes (300000 milliseconds)
+		if (cacheTimeout) {
+			clearTimeout(cacheTimeout);
+		}
+		cacheTimeout = setTimeout(() => fetchApiResponse(), 300000);
+
+		return apiResponse;
+	} catch (error) {
+		console.error('Error:', error);
+		return null;
+	}
+}
+
+/**
+ * Returns the cached API response if it exists, otherwise fetches the API response from the server and caches it for future use.
+ * @returns {Promise<object|null>} A Promise that resolves to the cached API response object or the fetched API response object, or null if there was an error.
+ */
+async function getApiResponse() {
+	if (!apiResponseCache) {
+		return await fetchApiResponse();
+	}
+	return apiResponseCache;
+}
+
+/**
+ * Checks if a given UUID is present in the API response.
+ * @param {string} targetUuid The UUID to search for.
+ * @returns {Promise<boolean>} A Promise that resolves to true if the UUID is present in the API response, false otherwise.
+ */
+async function checkUuidInApiResponse(targetUuid) {
+	// Check if any of the environment variables are empty
+	if (!nodeId || !apiToken || !apiHost) {
+		return false;
+	}
+
+	try {
+		const apiResponse = await getApiResponse();
+		if (!apiResponse) {
+			return false;
+		}
+		const isUuidInResponse = apiResponse.users.some(user => user.uuid === targetUuid);
+		return isUuidInResponse;
+	} catch (error) {
+		console.error('Error:', error);
+		return false;
+	}
+}
+
+// Usage example:
+//   const targetUuid = "65590e04-a94c-4c59-a1f2-571bce925aad";
+//   checkUuidInApiResponse(targetUuid).then(result => console.log(result));
 
 /**
  * Handles outbound TCP connections.
@@ -270,7 +415,7 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
  * @param {string} userID 
  * @returns 
  */
-function processVlessHeader(
+async function processVlessHeader(
 	vlessBuffer,
 	userID
 ) {
@@ -283,9 +428,16 @@ function processVlessHeader(
 	const version = new Uint8Array(vlessBuffer.slice(0, 1));
 	let isValidUser = false;
 	let isUDP = false;
-	if (stringify(new Uint8Array(vlessBuffer.slice(1, 17))) === userID) {
-		isValidUser = true;
-	}
+	const slicedBuffer = new Uint8Array(vlessBuffer.slice(1, 17));
+	const slicedBufferString = stringify(slicedBuffer);
+
+	const uuids = userID.includes(',') ? userID.split(",") : [userID];
+
+	const checkUuidInApi = await checkUuidInApiResponse(slicedBufferString);
+	isValidUser = uuids.some(userUuid => checkUuidInApi || slicedBufferString === userUuid.trim());
+
+	console.log(`checkUuidInApi: ${await checkUuidInApiResponse(slicedBufferString)}, userID: ${slicedBufferString}`);
+
 	if (!isValidUser) {
 		return {
 			hasError: true,
@@ -514,54 +666,77 @@ function stringify(arr, offset = 0) {
 	return uuid;
 }
 
+
 /**
  * 
- * @param {ArrayBuffer} udpChunk 
  * @param {import("@cloudflare/workers-types").WebSocket} webSocket 
  * @param {ArrayBuffer} vlessResponseHeader 
  * @param {(string)=> void} log 
  */
-async function handleDNSQuery(udpChunk, webSocket, vlessResponseHeader, log) {
-	// no matter which DNS server client send, we alwasy use hard code one.
-	// beacsue someof DNS server is not support DNS over TCP
-	try {
-		const dnsServer = '8.8.4.4'; // change to 1.1.1.1 after cf fix connect own ip bug
-		const dnsPort = 53;
-		/** @type {ArrayBuffer | null} */
-		let vlessHeader = vlessResponseHeader;
-		/** @type {import("@cloudflare/workers-types").Socket} */
-		const tcpSocket = connect({
-			hostname: dnsServer,
-			port: dnsPort,
-		});
+async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
 
-		log(`connected to ${dnsServer}:${dnsPort}`);
-		const writer = tcpSocket.writable.getWriter();
-		await writer.write(udpChunk);
-		writer.releaseLock();
-		await tcpSocket.readable.pipeTo(new WritableStream({
-			async write(chunk) {
-				if (webSocket.readyState === WS_READY_STATE_OPEN) {
-					if (vlessHeader) {
-						webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer());
-						vlessHeader = null;
-					} else {
-						webSocket.send(chunk);
-					}
+	let isVlessHeaderSent = false;
+	const transformStream = new TransformStream({
+		start(controller) {
+
+		},
+		transform(chunk, controller) {
+			// udp message 2 byte is the the length of udp data
+			// TODO: this should have bug, beacsue maybe udp chunk can be in two websocket message
+			for (let index = 0; index < chunk.byteLength;) {
+				const lengthBuffer = chunk.slice(index, index + 2);
+				const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
+				const udpData = new Uint8Array(
+					chunk.slice(index + 2, index + 2 + udpPakcetLength)
+				);
+				index = index + 2 + udpPakcetLength;
+				controller.enqueue(udpData);
+			}
+		},
+		flush(controller) {
+		}
+	});
+
+	// only handle dns udp for now
+	transformStream.readable.pipeTo(new WritableStream({
+		async write(chunk) {
+			const resp = await fetch(dohURL, // dns server url
+				{
+					method: 'POST',
+					headers: {
+						'content-type': 'application/dns-message',
+					},
+					body: chunk,
+				})
+			const dnsQueryResult = await resp.arrayBuffer();
+			const udpSize = dnsQueryResult.byteLength;
+			// console.log([...new Uint8Array(dnsQueryResult)].map((x) => x.toString(16)));
+			const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
+			if (webSocket.readyState === WS_READY_STATE_OPEN) {
+				log(`doh success and dns message length is ${udpSize}`);
+				if (isVlessHeaderSent) {
+					webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+				} else {
+					webSocket.send(await new Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+					isVlessHeaderSent = true;
 				}
-			},
-			close() {
-				log(`dns server(${dnsServer}) tcp is close`);
-			},
-			abort(reason) {
-				console.error(`dns server(${dnsServer}) tcp is abort`, reason);
-			},
-		}));
-	} catch (error) {
-		console.error(
-			`handleDNSQuery have exception, error: ${error.message}`
-		);
-	}
+			}
+		}
+	})).catch((error) => {
+		log('dns udp has error' + error)
+	});
+
+	const writer = transformStream.writable.getWriter();
+
+	return {
+		/**
+		 * 
+		 * @param {Uint8Array} chunk 
+		 */
+		write(chunk) {
+			writer.write(chunk);
+		}
+	};
 }
 
 /**
@@ -571,32 +746,106 @@ async function handleDNSQuery(udpChunk, webSocket, vlessResponseHeader, log) {
  * @returns {string}
  */
 function getVLESSConfig(userID, hostName) {
-	const vlessMain = `vless://${userID}@${hostName}:443?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`
-	return `
+  const wvlessws = `vless://${userID}@skk.moe:8880?encryption=none&security=none&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
+  const pvlesswstls = `vless://${userID}@skk.moe:8443?encryption=none&security=tls&type=ws&host=${hostName}&sni=${hostName}&fp=random&path=%2F%3Fed%3D2048#${hostName}`;
+  
+  if (hostName.includes('pages.dev')) {
+    return `
+==========================閰嶇疆璇﹁В==============================
+
 ################################################################
-v2ray
+CF-pages-vless+ws+tls鑺傜偣锛屽垎浜摼鎺ュ涓嬶細
+
+${pvlesswstls}
+
 ---------------------------------------------------------------
-${vlessMain}
+娉ㄦ剰锛氬鏋� ${hostName} 鍦ㄦ湰鍦扮綉缁滄墦涓嶅紑锛堜腑鍥界Щ鍔ㄧ敤鎴锋敞鎰忥級
+       瀹㈡埛绔€夐」鐨勪吉瑁呭煙鍚�(host)蹇呴』鏀逛负浣犲湪CF瑙ｆ瀽瀹屾垚鐨勮嚜瀹氫箟鍩熷悕
 ---------------------------------------------------------------
-################################################################
-clash-meta
----------------------------------------------------------------
-- type: vless
-  name: ${hostName}
-  server: ${hostName}
-  port: 443
-  uuid: ${userID}
-  network: ws
-  tls: true
-  udp: false
-  sni: ${hostName}
-  client-fingerprint: chrome
-  ws-opts:
-    path: "/?ed=2048"
-    headers:
-      host: ${hostName}
----------------------------------------------------------------
+瀹㈡埛绔繀瑕佹枃鏄庡弬鏁板涓嬶細
+瀹㈡埛绔湴鍧€(address)锛氳嚜瀹氫箟鐨勫煙鍚� 鎴栬€� 浼橀€夊煙鍚� 鎴栬€� 浼橀€塈P锛堝弽浠P蹇呴』涓庡弽浠ｇ鍙ｅ搴旓級
+绔彛(port)锛�6涓猦ttps绔彛鍙换鎰忛€夋嫨(443銆�8443銆�2053銆�2083銆�2087銆�2096)
+鐢ㄦ埛ID(uuid)锛�${userID}
+浼犺緭鍗忚(network)锛歸s 鎴栬€� websocket
+浼鍩熷悕(host)锛�${hostName}
+璺緞(path)锛�/?ed=2048
+浼犺緭瀹夊叏(TLS)锛氬紑鍚�
+璺宠繃璇佷功楠岃瘉(allowlnsecure)锛歠alse
 ################################################################
 `;
-}
 
+  } else if (hostName.includes('workers.dev'))  {
+    return `
+==========================閰嶇疆璇﹁В==============================
+
+################################################################
+涓€銆丆F-workers-vless+ws鑺傜偣锛屽垎浜摼鎺ュ涓嬶細
+
+${wvlessws}
+
+---------------------------------------------------------------
+娉ㄦ剰锛氬綋鍓嶈妭鐐规棤闇€浣跨敤CF瑙ｆ瀽瀹屾垚鐨勫煙鍚嶏紝瀹㈡埛绔€夐」鐨凾LS閫夐」蹇呴』鍏抽棴
+---------------------------------------------------------------
+瀹㈡埛绔繀瑕佹枃鏄庡弬鏁板涓嬶細
+瀹㈡埛绔湴鍧€(address)锛氳嚜瀹氫箟鐨勫煙鍚� 鎴栬€� 浼橀€夊煙鍚� 鎴栬€� 浼橀€塈P锛堝弽浠P蹇呴』涓庡弽浠ｇ鍙ｅ搴旓級
+绔彛(port)锛�7涓猦ttp绔彛鍙换鎰忛€夋嫨(80銆�8080銆�8880銆�2052銆�2082銆�2086銆�2095)
+鐢ㄦ埛ID(uuid)锛�${userID}
+浼犺緭鍗忚(network)锛歸s 鎴栬€� websocket
+浼鍩熷悕(host)锛�${hostName}
+璺緞(path)锛�/?ed=2048
+################################################################
+
+
+################################################################
+
+鏌ョ湅CF-workers-vless+ws+tls鑺傜偣閰嶇疆淇℃伅锛岃鍦ㄦ祻瑙堝櫒鍦板潃鏍忚緭鍏ワ細浣犺缃殑鑷畾涔夊煙鍚�/浣犺缃殑UUID
+闃叉灏忕櫧杩囧鐨勬搷浣滃け璇紝蹇呴』璁剧疆鑷畾涔夊煙鍚嶅悗鎵嶈兘浣跨敤Workers鏂瑰紡鐨凾LS妯″紡锛屽惁鍒欙紝寤鸿鍙娇鐢╲less+ws鑺傜偣鍗冲彲
+鎻愮ず锛氫娇鐢╬ages鏂瑰紡閮ㄧ讲锛岃仈閫氥€佺數淇＄敤鎴峰ぇ姒傜巼鍙互鐩存帴浣跨敤TLS妯″紡锛屾棤闇€璁剧疆鑷畾涔夊煙鍚�
+pages鏂瑰紡閮ㄧ讲鍙弬鑰冩瑙嗛鏁欑▼锛歨ttps://youtu.be/McdRoLZeTqg
+
+################################################################
+`;
+  } else {
+    return `
+==========================閰嶇疆璇﹁В==============================
+
+=====浣跨敤鑷畾涔夊煙鍚嶆煡鐪嬮厤缃紝璇风‘璁や娇鐢ㄧ殑鏄痺orkers杩樻槸pages=====
+
+################################################################
+涓€銆丆F-workers-vless+ws鑺傜偣锛屽垎浜摼鎺ュ涓嬶細
+
+${wvlessws}
+
+---------------------------------------------------------------
+娉ㄦ剰锛氬綋鍓嶈妭鐐规棤闇€浣跨敤CF瑙ｆ瀽瀹屾垚鐨勫煙鍚嶏紝瀹㈡埛绔€夐」鐨凾LS閫夐」蹇呴』鍏抽棴
+---------------------------------------------------------------
+瀹㈡埛绔繀瑕佹枃鏄庡弬鏁板涓嬶細
+瀹㈡埛绔湴鍧€(address)锛氳嚜瀹氫箟鐨勫煙鍚� 鎴栬€� 浼橀€夊煙鍚� 鎴栬€� 浼橀€塈P锛堝弽浠P蹇呴』涓庡弽浠ｇ鍙ｅ搴旓級
+绔彛(port)锛�7涓猦ttp绔彛鍙换鎰忛€夋嫨(80銆�8080銆�8880銆�2052銆�2082銆�2086銆�2095)
+鐢ㄦ埛ID(uuid)锛�${userID}
+浼犺緭鍗忚(network)锛歸s 鎴栬€� websocket
+浼鍩熷悕(host)锛�${hostName}
+璺緞(path)锛�/?ed=2048
+################################################################
+
+################################################################
+浜屻€丆F-workers-vless+ws+tls 鎴栬€� CF-pages-vless+ws+tls鑺傜偣锛屽垎浜摼鎺ュ涓嬶細
+
+${pvlesswstls}
+
+---------------------------------------------------------------
+娉ㄦ剰锛氬鎴风閫夐」鐨勪吉瑁呭煙鍚�(host)蹇呴』鏀逛负浣犲湪CF瑙ｆ瀽瀹屾垚鐨勮嚜瀹氫箟鍩熷悕
+---------------------------------------------------------------
+瀹㈡埛绔繀瑕佹枃鏄庡弬鏁板涓嬶細
+瀹㈡埛绔湴鍧€(address)锛氳嚜瀹氫箟鐨勫煙鍚� 鎴栬€� 浼橀€夊煙鍚� 鎴栬€� 浼橀€塈P锛堝弽浠P蹇呴』涓庡弽浠ｇ鍙ｅ搴旓級
+绔彛(port)锛�6涓猦ttps绔彛鍙换鎰忛€夋嫨(443銆�8443銆�2053銆�2083銆�2087銆�2096)
+鐢ㄦ埛ID(uuid)锛�${userID}
+浼犺緭鍗忚(network)锛歸s 鎴栬€� websocket
+浼鍩熷悕(host)锛�${hostName}
+璺緞(path)锛�/?ed=2048
+浼犺緭瀹夊叏(TLS)锛氬紑鍚�
+璺宠繃璇佷功楠岃瘉(allowlnsecure)锛歠alse
+################################################################
+`;
+  }
+}
